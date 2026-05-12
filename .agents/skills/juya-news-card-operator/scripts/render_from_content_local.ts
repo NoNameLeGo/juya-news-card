@@ -4,6 +4,9 @@ import path from 'node:path';
 import { chromium } from 'playwright';
 import { generateHtmlFromReactComponent } from '../../../../server/ssr-helper.js';
 import { TEMPLATES } from '../../../../src/templates/index.js';
+import { loadIconCatalogFromCdn } from '../../../../src/utils/icon-cdn-catalog.js';
+import { resolveIconMappingRuntimeConfig } from '../../../../src/utils/icon-config.js';
+import { applyIconMappingToContent } from '../../../../src/utils/icon-resolution.js';
 
 function usage(): void {
   console.log(`Usage:
@@ -102,8 +105,12 @@ function listThemes(): void {
 }
 
 function injectOptionalFont(html: string): string {
-  const fontPath = path.join(process.cwd(), 'assets/htmlFont.ttf');
-  if (!fs.existsSync(fontPath)) return html;
+  const fontCandidates = [
+    path.join(process.cwd(), 'assets/htmlFont.ttf'),
+    path.join(process.cwd(), 'public/assets/htmlFont.ttf'),
+  ];
+  const fontPath = fontCandidates.find(p => fs.existsSync(p));
+  if (!fontPath) return html;
 
   const fontBase64 = fs.readFileSync(fontPath).toString('base64');
   const style = `
@@ -152,8 +159,21 @@ async function main(): Promise<void> {
   if (!template.ssrReady) throw new Error(`Template not SSR-ready: ${templateId}`);
 
   const raw = fs.readFileSync(contentFile, 'utf-8');
-  const content = toRenderContent(JSON.parse(raw));
+  let content = toRenderContent(JSON.parse(raw));
   validateContent(content);
+
+  const iconMappingConfig = resolveIconMappingRuntimeConfig(process.env);
+  if (iconMappingConfig.enabled) {
+    try {
+      const cdnIcons = await loadIconCatalogFromCdn(iconMappingConfig.cdnUrl, {
+        ttlMs: iconMappingConfig.cdnCacheTtlMs,
+        timeoutMs: iconMappingConfig.cdnFetchTimeoutMs,
+      });
+      content = applyIconMappingToContent(content, { fallbackIcon: iconMappingConfig.fallbackIcon, cdnIcons });
+    } catch (error) {
+      console.warn('Icon mapping failed, falling back to raw icons:', error);
+    }
+  }
 
   const html = injectOptionalFont(generateHtmlFromReactComponent(content, templateId));
   const browser = await chromium.launch();
@@ -164,7 +184,7 @@ async function main(): Promise<void> {
     });
     try {
       const page = await context.newPage();
-      await page.setContent(html, { waitUntil: 'networkidle' });
+      await page.setContent(html, { waitUntil: 'networkidle', timeout: 30000 });
       if (waitMs > 0) await page.waitForTimeout(waitMs);
 
       const outputDir = path.dirname(outputPath);
